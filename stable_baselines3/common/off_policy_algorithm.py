@@ -172,7 +172,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
 
         callback.on_rollout_start()
         continue_training = True
-
+        
         while total_steps < n_steps or total_episodes < n_episodes:
             done = False
             episode_reward, episode_timesteps = 0.0, 0
@@ -232,7 +232,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                         # Avoid changing the original ones
                         self._last_original_obs, new_obs_, reward_ = self._last_obs, new_obs, reward
 
-                    replay_buffer.add(self._last_original_obs, new_obs_, buffer_action, reward_, done)
+                    replay_buffer.add(self._last_original_obs, new_obs_, buffer_action, reward_, done, infos)
 
                 self._last_obs = new_obs
                 # Save the unnormalized observation
