@@ -169,7 +169,8 @@ class ReplayBuffer(BaseBuffer):
             next_obs: np.ndarray,
             action: np.ndarray,
             reward: np.ndarray,
-            done: np.ndarray) -> None:
+            done: np.ndarray,
+            info: np.ndarray = None) -> None:
         # Copy to avoid modification by reference
         self.observations[self.pos] = np.array(obs).copy()
         self.next_observations[self.pos] = np.array(next_obs).copy()

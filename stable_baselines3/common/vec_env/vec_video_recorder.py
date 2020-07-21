@@ -89,7 +89,7 @@ class VecVideoRecorder(VecEnvWrapper):
             self.video_recorder.capture_frame()
             self.recorded_frames += 1
             if self.recorded_frames > self.video_length:
-                logger.info("Saving video to ", self.video_recorder.path)
+                # logger.info("Saving video to ", self.video_recorder.path)
                 self.close_video_recorder()
         elif self._video_enabled():
             self.start_video_recorder()

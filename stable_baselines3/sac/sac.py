@@ -172,6 +172,8 @@ class SAC(OffPolicyAlgorithm):
 
             # Action by the current actor for the sampled state
             actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
+            # unique, counts = np.unique(actions_pi.cpu(), return_counts=True)
+            # print(dict(zip(unique, counts)))
             log_prob = log_prob.reshape(-1, 1)
 
             ent_coef_loss = None
