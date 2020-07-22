@@ -7,7 +7,9 @@ from stable_baselines3.common import logger
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 from stable_baselines3.common.noise import ActionNoise
-from stable_baselines3.sac.policies import SACPolicy
+from stable_baselines3.awac.policies import AWACPolicy
+from stable_baselines3.common.buffers import ReplayBuffer
+from tqdm import tqdm,trange
 
 
 class AWAC(OffPolicyAlgorithm):
@@ -71,6 +73,7 @@ class AWAC(OffPolicyAlgorithm):
 				 target_update_interval: int = 1,
 				 target_entropy: Union[str, float] = 'auto',
 				 awr_use_mle_for_vf: bool = True,
+				 beta: int = 50,
 				 tensorboard_log: Optional[str] = None,
 				 create_eval_env: bool = False,
 				 policy_kwargs: Dict[str, Any] = None,
@@ -79,7 +82,7 @@ class AWAC(OffPolicyAlgorithm):
 				 device: Union[th.device, str] = 'auto',
 				 _init_setup_model: bool = True):
 
-		super().__init__(policy, env, SACPolicy, learning_rate,
+		super().__init__(policy, env, AWACPolicy, learning_rate,
 								  buffer_size, learning_starts, batch_size,
 								  policy_kwargs, tensorboard_log, verbose, device,
 								  create_eval_env=create_eval_env, seed=seed,
@@ -101,6 +104,7 @@ class AWAC(OffPolicyAlgorithm):
 		self.gamma = gamma
 		self.ent_coef_optimizer = None
 		self.awr_use_mle_for_vf = awr_use_mle_for_vf
+		self.beta = beta
 		self.bc_buffer = None
 
 		if _init_setup_model:
@@ -149,18 +153,20 @@ class AWAC(OffPolicyAlgorithm):
 
 	def pretrain_bc(self, gradient_steps: int, batch_size: int = 64):
 		statistics = []
-		for gradient_step in range(gradient_steps):
-			replay_data = self.bc_buffer.sample(batch_size, env=self._vec_normalize_env)
-			actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
-			actor_logpp = self.actor.action_dist.log_prob(actions_pi)
-			actor_loss = -actor_logpp.mean()
-			actor_mse_loss = F.mse_loss(actions_pi.detach(),replay_data.actions)
+		with trange(gradient_steps) as t:
+			for gradient_step in t:
+				replay_data = self.bc_buffer.sample(batch_size, env=self._vec_normalize_env)
+				dist = self.actor(replay_data.observations)
+				actions_pi, log_prob = dist.log_prob_and_rsample()
+				actor_loss = -log_prob.mean()
+				actor_mse_loss = F.mse_loss(actions_pi.detach(),replay_data.actions)
 
-			self.actor.optimizer.zero_grad()
-			actor_loss.backward()
-			self.actor.optimizer.step()
+				self.actor.optimizer.zero_grad()
+				actor_loss.backward()
+				self.actor.optimizer.step()
 
-			statistics.append((actor_loss.item(),actor_mse_loss.item()))
+				statistics.append((actor_loss.item(),actor_mse_loss.item()))
+				t.set_postfix(mse_loss=actor_mse_loss.item(),policy_loss=actor_loss.item())
 		actor_losses,mse_losses = tuple(zip(*statistics))
 
 		logger.record("pretrain/n_updates", self._n_updates, exclude='tensorboard')
@@ -169,11 +175,13 @@ class AWAC(OffPolicyAlgorithm):
 
 	def pretrain_rl(self, gradient_steps: int, batch_size: int = 64) -> None:
 		statistics = []
-		for gradient_step in range(gradient_steps):
-			replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
-			stats = self.train_batch(replay_data)
-			statistics.append(stats)
-			self._n_updates += 1
+		with trange(gradient_steps) as t:
+			for gradient_step in t:
+				replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+				stats = self.train_batch(replay_data)
+				statistics.append(stats)
+				self._n_updates += 1
+				t.set_postfix(qf_loss=stats[1],policy_loss=stats[0])
 		actor_losses,critic_losses,ent_coef_losses,ent_coefs = tuple(zip(*statistics))
 
 		logger.record("pretrain/n_updates", self._n_updates, exclude='tensorboard')
@@ -199,9 +207,9 @@ class AWAC(OffPolicyAlgorithm):
 
 	def train_batch(self,replay_data):
 		# Action by the current actor for the sampled state
-		actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
-		log_prob = log_prob.reshape(-1, 1)
-		actor_mle = self.actor(replay_data.observations,deterministic=True)
+		dist = self.actor(replay_data.observations)
+		actions_pi, log_prob = dist.log_prob_and_rsample()
+		actor_mle = dist.mean
 
 		"""ent_coeff loss"""
 		ent_coef_loss = None
@@ -213,18 +221,19 @@ class AWAC(OffPolicyAlgorithm):
 			ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
 		else:
 			ent_coef = self.ent_coef_tensor
-			ent_coef_loss = th.tensor([0])
 
 		"""q loss"""
 		with th.no_grad():
 			# Select action according to policy
-			next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
+			next_dist = self.actor(replay_data.next_observations)
+			next_actions, next_log_prob = next_dist.log_prob_and_rsample()
 			# Compute the target Q value
 			target_q1, target_q2 = self.critic_target(replay_data.next_observations, next_actions)
 			target_q = th.min(target_q1, target_q2)
 			target_q = replay_data.rewards + (1 - replay_data.dones) * self.gamma * target_q
 			# td error + entropy term
-			q_backup = target_q - ent_coef * next_log_prob.reshape(-1, 1)
+			# q_backup = target_q - ent_coef * next_log_prob
+			q_backup = target_q
 		# Get current Q estimates
 		# using action from the replay buffer
 		current_q1, current_q2 = self.critic(replay_data.observations, replay_data.actions)
@@ -233,18 +242,21 @@ class AWAC(OffPolicyAlgorithm):
 
 		"""action loss"""
 		# Advantage-weighted regression
-		if self.awr_use_mle_for_vf:
-			v1_pi,v2_pi = self.critic(replay_data.observations, actor_mle)
-			v_pi = th.min(v1_pi, v2_pi)
-		else:
-			v1_pi,v2_pi = self.critic(replay_data.observations, actions_pi)
-			v_pi = th.min(v1_pi, v2_pi)
-		q_adv = th.min(current_q1, current_q2)
+		# if self.awr_use_mle_for_vf:
+		# 	v1_pi,v2_pi = self.critic(replay_data.observations, actor_mle)
+		# 	v_pi = th.min(v1_pi, v2_pi)
+		# else:
+		# 	v1_pi,v2_pi = self.critic(replay_data.observations, actions_pi)
+		# 	v_pi = th.min(v1_pi, v2_pi)
+		q_adv = th.min(current_q1,current_q2)
+		v1_pi,v2_pi = self.critic(replay_data.observations, actor_mle)
+		v_pi = th.min(v1_pi, v2_pi)
+		# q_adv = th.min(*self.critic(replay_data.observations, actions_pi))
 		score = q_adv - v_pi
-		weights = F.softmax(score / self.beta, dim=0)[:, 0]
-		actor_loss = ent_coeff * log_prob.mean()
-		actor_logpp = self.actor.action_dist.log_prob(replay_data.actions)
-		actor_loss = actor_loss + (-actor_logpp * len(weights)*weights.detach()).mean()
+		weights = F.softmax(score/self.beta,dim=0)
+		# actor_loss = ent_coef * log_prob.mean()
+		actor_logpp = dist.log_prob(replay_data.actions)
+		actor_loss = (-actor_logpp * len(weights)*weights.detach()).mean()
 
 		"""Updates"""
 		# Optimize entropy coefficient, also called
@@ -267,6 +279,8 @@ class AWAC(OffPolicyAlgorithm):
 			for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
 				target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 		
+		if ent_coef_loss is None:
+			ent_coef_loss = th.tensor([0])
 		return actor_loss.item(),critic_loss.item(),ent_coef_loss.item(),ent_coef.item()
 
 	def learn(self,
@@ -285,10 +299,11 @@ class AWAC(OffPolicyAlgorithm):
 													  tb_log_name)
 		callback.on_training_start(locals(), globals())
 
-		self.pretrain_bc(int(1e4),batch_size=self.batch_size)
-		observations,actions,new_observations,rewards,dones = self.bc_buffer.observations,self.bc_buffer.actions,self.bc_buffer.new_observations,self.bc_buffer.rewards,self.bc_buffer.dones
-		self.replay_buffer.extend(list(zip(observations,new_observations,actions,rewards,dones)))
-		self.pretrain_rl(int(1e5),batch_size=self.batch_size)
+		self.pretrain_bc(int(1e3),batch_size=self.batch_size)
+		observations,actions,next_observations,rewards,dones = self.bc_buffer.observations,self.bc_buffer.actions,self.bc_buffer.next_observations,self.bc_buffer.rewards,self.bc_buffer.dones
+		for data in zip(observations,next_observations,actions,rewards,dones):
+			self.replay_buffer.add(*data)
+		self.pretrain_rl(int(1e4),batch_size=self.batch_size)
 
 		while self.num_timesteps < total_timesteps:
 			rollout = self.collect_rollouts(self.env, n_episodes=self.n_episodes_rollout,

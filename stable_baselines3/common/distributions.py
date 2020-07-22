@@ -4,6 +4,7 @@ import torch as th
 import torch.nn as nn
 from torch.distributions import Normal, Categorical, Bernoulli
 from gym import spaces
+th.distributions.Distribution.set_default_validate_args(True)
 
 from stable_baselines3.common.preprocessing import get_action_dim
 
